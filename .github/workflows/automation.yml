@@ -1,0 +1,32 @@
+name: Video Processing Automation Pipeline
+
+on:
+  schedule:
+    - cron: '0 */6 * * *' # Automated execution trigger every 6 hours
+  workflow_dispatch:      # Grants manual play button trigger via GitHub UI
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository Contents
+      uses: actions/checkout@v4
+
+    - name: Set up Python Environment
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Install System Dependencies (FFmpeg & Python Libraries)
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -qq ffmpeg
+        python -m pip install --upgrade pip
+        pip install yt-dlp google-api-python-client google-auth requests
+
+    - name: Run Automation Pipeline Engine
+      env:
+        VIDARA_API_KEY: ${{ secrets.VIDARA_API_KEY }}
+        GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      run: python pipeline.py
