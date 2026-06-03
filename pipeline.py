@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import subprocess
 import requests
 from google.oauth2.service_account import Credentials
@@ -10,7 +11,7 @@ from googleapiclient.discovery import build
 # =======================================================
 API_KEY = os.environ.get("VIDARA_API_KEY")
 SPREADSHEET_ID = "1HsNADnc31PtDctLE8j8pNag0YA8YIbTg1BjTJ1XxPO4"
-RANGE_NAME = "Sheet1!A:D"  # Adjusted assuming sheet title is Sheet1
+RANGE_NAME = "Sheet1!A:D"  # Columns: A=Title, B=Link, C=Status, D=Error
 
 # Authenticate Google Sheets API
 gcp_creds_json = json.loads(os.environ.get("GCP_SERVICE_ACCOUNT"))
@@ -39,7 +40,7 @@ def fetch_upload_server():
         response.raise_for_status()
         res_json = response.json()
         if res_json.get("status") != 200:
-            raise Exception(f"API Error: {res_json.get('message', 'Unknown status')}")
+            raise Exception(f"API Server Error: {res_json.get('message', 'Unknown status')}")
         return res_json["result"]["upload_server"]
     except Exception as e:
         print(f"Error getting server: {e}")
@@ -59,20 +60,22 @@ def upload_to_vidara(upload_server, video_path):
             )
         response.raise_for_status()
         data = response.json()
-        if "filecode" in data:
-            return {"success": True, "remote_url": f"https://vidara.so/{data['filecode']}"}
-        elif data.get("result", {}).get("filecode"):
-            return {"success": True, "remote_url": f"https://vidara.so/{data['result']['filecode']}"}
+        
+        if "filecode" in data or data.get("result", {}).get("filecode"):
+            return {"success": True}
         else:
-            return {"success": False, "error": f"Invalid frame structure: {data}"}
+            return {"success": False, "error": f"Invalid server response: {data}"}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+def sanitize_filename(filename):
+    """Removes illegal filesystem characters."""
+    return re.sub(r'[\\/*?:"<>|]', "", filename).strip()
 
 # =======================================================
 # PIPELINE EXECUTION ENGINE
 # =======================================================
 def main():
-    # Read the Sheet
     result = sheet.values().get(spreadsheetId=SPREADSHEET_ID, range=RANGE_NAME).execute()
     rows = result.get("values", [])
     
@@ -80,26 +83,19 @@ def main():
         print("Empty sheet found.")
         return
 
-    # Extract Header and check row entries
-    header = rows[0]
-    print(f"Extracted Sheet Header: {header}")
-
-    # Fetch fresh Upload Destination 
     UPLOAD_SERVER = fetch_upload_server()
     if not UPLOAD_SERVER:
         print("Exiting pipeline: Vidara endpoint lookup failed.")
         return
 
-    # Loop rows starting from index 1 (skip header)
     for index, row in enumerate(rows[1:], start=2):
-        # Pad columns dynamically to avoid out of bounds exceptions
         while len(row) < 4:
             row.append("")
             
-        title, link, status, error = row[0], row[1], row[2], row[3]
+        title, link, status, error = row[0].strip(), row[1].strip(), row[2].strip(), row[3].strip()
         
         # Skip if already marked success or failed
-        if status.strip().lower() in ["success", "failed"]:
+        if status.lower() in ["success", "failed"]:
             print(f"Row {index}: Skipped ({status})")
             continue
             
@@ -107,10 +103,14 @@ def main():
             print(f"Row {index}: Skipped due to empty download target URL.")
             continue
 
-        print(f"\n--- Processing Row {index}: {title or 'No Title'} ---")
-        output_file = f"video_{index}.mp4"
+        print(f"\n--- Processing Row {index}: {title or 'Untitled'} ---")
         
-        # Step 1: High-Speed Downstream Capture via yt-dlp Subprocess execution
+        # Define clean target filename from Title column
+        clean_title = sanitize_filename(title) if title else f"video_{index}"
+        final_video_name = f"{clean_title}.mp4"
+        temp_download_name = f"temp_download_{index}.mp4"
+        
+        # Step 1: Download to a predictable temporary file
         try:
             cmd = [
                 "yt-dlp",
@@ -120,7 +120,7 @@ def main():
                 "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
                 "--newline", "--no-part", "--retries", "10", "--fragment-retries", "10",
                 "--concurrent-fragments", "8", "-N", "8",
-                "-o", output_file, link
+                "-o", temp_download_name, link
             ]
             subprocess.run(cmd, check=True)
         except subprocess.CalledProcessError as err:
@@ -131,32 +131,47 @@ def main():
             ).execute()
             continue
 
-        # Step 2: Verification & Vidara Cloud Handoff
-        if os.path.exists(output_file):
-            print(f"Downloaded asset verified. Performing API stream upload...")
-            upload_result = upload_to_vidara(UPLOAD_SERVER, output_file)
-            
-            if upload_result["success"]:
-                print(f"Successfully processed Row {index}!")
+        # Step 2: Explicitly rename the file to match the Title column exactly
+        if os.path.exists(temp_download_name):
+            try:
+                if os.path.exists(final_video_name):
+                    os.remove(final_video_name)
+                os.rename(temp_download_name, final_video_name)
+            except Exception as rename_err:
                 sheet.values().update(
                     spreadsheetId=SPREADSHEET_ID, range=f"Sheet1!C{index}:D{index}",
-                    valueInputOption="RAW", body={"values": [["SUCCESS", upload_result["remote_url"]]]}
+                    valueInputOption="RAW", body={"values": [["FAILED", f"File renaming failed: {rename_err}"]]}
                 ).execute()
-            else:
-                print(f"Upload logic failure on Row {index}.")
-                sheet.values().update(
-                    spreadsheetId=SPREADSHEET_ID, range=f"Sheet1!C{index}:D{index}",
-                    valueInputOption="RAW", body={"values": [["FAILED", upload_result["error"]]]}
-                ).execute()
-                
-            # Safely clear cache
-            if os.path.exists(output_file):
-                os.remove(output_file)
+                continue
         else:
             sheet.values().update(
                 spreadsheetId=SPREADSHEET_ID, range=f"Sheet1!C{index}:D{index}",
-                valueInputOption="RAW", body={"values": [["FAILED", "Target artifact missing post compilation execution"]]}
+                valueInputOption="RAW", body={"values": [["FAILED", "Downloaded file missing post compilation execution"]]}
             ).execute()
+            continue
+
+        # Step 3: Vidara Cloud Handoff with renamed file
+        print(f"Uploading file named: '{final_video_name}' to Vidara...")
+        upload_result = upload_to_vidara(UPLOAD_SERVER, final_video_name)
+        
+        if upload_result["success"]:
+            print(f"Successfully processed Row {index}!")
+            # Updates Status to SUCCESS, clears out Error cell entirely
+            sheet.values().update(
+                spreadsheetId=SPREADSHEET_ID, range=f"Sheet1!C{index}:D{index}",
+                valueInputOption="RAW", body={"values": [["SUCCESS", ""]]}
+            ).execute()
+        else:
+            print(f"Upload logic failure on Row {index}.")
+            # Updates Status to FAILED, writes error details to Error column
+            sheet.values().update(
+                spreadsheetId=SPREADSHEET_ID, range=f"Sheet1!C{index}:D{index}",
+                valueInputOption="RAW", body={"values": [["FAILED", upload_result["error"]]]}
+            ).execute()
+            
+        # Clean up local file storage cache
+        if os.path.exists(final_video_name):
+            os.remove(final_video_name)
 
 if __name__ == "__main__":
     main()
