@@ -19,18 +19,6 @@ creds = Credentials.from_service_account_info(gcp_creds_json, scopes=["https://w
 service = build("sheets", "v4", credentials=creds)
 sheet = service.spreadsheets()
 
-# Write cookies file
-cookies_content = r'''# Netscape HTTP Cookie File
-# https://curl.haxx.se/rfc/cookie_spec.html
-
-njavtv.com  FALSE / FALSE 1794810815  user_uuid YOUR_COOKIE
-njavtv.com  FALSE / TRUE  1779266015  XSRF-TOKEN  YOUR_COOKIE
-njavtv.com  FALSE / TRUE  1779266015  missav_session  YOUR_COOKIE
-.njavtv.com TRUE  / TRUE  1794810816  cf_clearance  YOUR_COOKIE
-'''
-with open("cookies.txt", "w", encoding="utf-8") as f:
-    f.write(cookies_content)
-
 # =======================================================
 # API FUNCTIONS
 # =======================================================
@@ -49,22 +37,32 @@ def fetch_upload_server():
 def upload_to_vidara(upload_server, video_path):
     if not os.path.exists(video_path):
         return {"success": False, "error": "Local file target not found."}
+    
     filename = os.path.basename(video_path)
+    print(f"\n[^] Handshaking multipart stream upload for: '{filename}'...")
     try:
         with open(video_path, "rb") as fp:
+            # Packing the payload cleanly as a multipart tuple form field
+            payload = {
+                "api_key": (None, API_KEY),
+                "file": (filename, fp, "video/mp4")
+            }
             response = requests.post(
                 upload_server,
-                files={"file": (filename, fp, "video/mp4")},
-                data={"api_key": API_KEY},
-                timeout=None
+                files=payload,
+                timeout=None  # Stay open for big transfers
             )
         response.raise_for_status()
         data = response.json()
         
-        if "filecode" in data or data.get("result", {}).get("filecode"):
-            return {"success": True}
+        if "filecode" in data:
+            return {"success": True, "filecode": data["filecode"]}
+        elif data.get("result", {}).get("filecode"):
+            return {"success": True, "filecode": data["result"]["filecode"]}
         else:
-            return {"success": False, "error": f"Invalid server response: {data}"}
+            return {"success": False, "error": f"Invalid server response frame: {data}"}
+    except requests.exceptions.HTTPError as http_err:
+        return {"success": False, "error": f"Vidara rejected payload ({response.status_code}): {response.text}"}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -108,54 +106,44 @@ def main():
         # Define clean target filename from Title column
         clean_title = sanitize_filename(title) if title else f"video_{index}"
         final_video_name = f"{clean_title}.mp4"
-        temp_download_name = f"temp_download_{index}.mp4"
         
-        # Step 1: Download to a predictable temporary file
-        try:
-            cmd = [
-                "yt-dlp",
-                "--cookies", "cookies.txt",
-                "--add-header", "Referer:https://njavtv.com/",
-                "--add-header", "Origin:https://njavtv.com",
-                "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-                "--newline", "--no-part", "--retries", "10", "--fragment-retries", "10",
-                "--concurrent-fragments", "8", "-N", "8",
-                "-o", temp_download_name, link
-            ]
-            subprocess.run(cmd, check=True)
-        except subprocess.CalledProcessError as err:
+        # Step 1: Downstream Capture via Direct FFMPEG Socket
+        print(f"Bypassing Cloudflare wrapper via direct ffmpeg socket...")
+        
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-headers", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36\r\n"
+                       "Referer: https://missav.live/\r\n"
+                       "Origin: https://missav.live\r\n",
+            "-i", link,
+            "-c", "copy",          # Stream copy mode (Instant, no re-encoding)
+            "-bsf:a", "aac_adtstoasc",
+            "-y",                  # Overwrite if exists
+            final_video_name
+        ]
+        
+        # Run stream dump and collect output diagnostics
+        process = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        
+        # Verify if the output file was generated and contains data
+        if not (os.path.exists(final_video_name) and os.path.getsize(final_video_name) > 0):
             print(f"Download Engine Failed for Row {index}.")
+            # Extract the last few lines of the logs to understand what broke
+            log_tail = process.stdout[-500:] if process.stdout else "No log trace available."
             sheet.values().update(
                 spreadsheetId=SPREADSHEET_ID, range=f"Sheet1!C{index}:D{index}",
-                valueInputOption="RAW", body={"values": [["FAILED", f"yt-dlp download failed: {err}"]]}
+                valueInputOption="RAW", body={"values": [["FAILED", f"ffmpeg capture failed. Log Tail: {log_tail}"]]}
             ).execute()
             continue
 
-        # Step 2: Explicitly rename the file to match the Title column exactly
-        if os.path.exists(temp_download_name):
-            try:
-                if os.path.exists(final_video_name):
-                    os.remove(final_video_name)
-                os.rename(temp_download_name, final_video_name)
-            except Exception as rename_err:
-                sheet.values().update(
-                    spreadsheetId=SPREADSHEET_ID, range=f"Sheet1!C{index}:D{index}",
-                    valueInputOption="RAW", body={"values": [["FAILED", f"File renaming failed: {rename_err}"]]}
-                ).execute()
-                continue
-        else:
-            sheet.values().update(
-                spreadsheetId=SPREADSHEET_ID, range=f"Sheet1!C{index}:D{index}",
-                valueInputOption="RAW", body={"values": [["FAILED", "Downloaded file missing post compilation execution"]]}
-            ).execute()
-            continue
+        print(f"[✓] Video successfully intercepted via ffmpeg pipeline. Size: {os.path.getsize(final_video_name) / (1024*1024):.2f} MB")
 
-        # Step 3: Vidara Cloud Handoff with renamed file
+        # Step 2: Vidara Cloud Handoff
         print(f"Uploading file named: '{final_video_name}' to Vidara...")
         upload_result = upload_to_vidara(UPLOAD_SERVER, final_video_name)
         
         if upload_result["success"]:
-            print(f"Successfully processed Row {index}!")
+            print(f"Successfully processed Row {index}! Remote Code: {upload_result.get('filecode')}")
             # Updates Status to SUCCESS, clears out Error cell entirely
             sheet.values().update(
                 spreadsheetId=SPREADSHEET_ID, range=f"Sheet1!C{index}:D{index}",
@@ -169,9 +157,13 @@ def main():
                 valueInputOption="RAW", body={"values": [["FAILED", upload_result["error"]]]}
             ).execute()
             
-        # Clean up local file storage cache
+        # Step 3: Clean up local file storage cache
         if os.path.exists(final_video_name):
-            os.remove(final_video_name)
+            try:
+                os.remove(final_video_name)
+                print("[✓] Local file cache cleared safely.")
+            except Exception as ce:
+                print(f"[!] Warning: Minor file wipe alert: {ce}")
 
 if __name__ == "__main__":
     main()
