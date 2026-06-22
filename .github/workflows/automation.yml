@@ -1,9 +1,7 @@
 name: Video Processing Automation Pipeline
 
 on:
-  schedule:
-    - cron: '0 */6 * * *' # Automated execution trigger every 6 hours
-  workflow_dispatch:      # Grants manual play button trigger via GitHub UI
+  workflow_dispatch: # Manual trigger via GitHub Actions UI
 
 jobs:
   run-pipeline:
