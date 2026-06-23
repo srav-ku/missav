@@ -4,6 +4,8 @@ import re
 import subprocess
 import requests
 import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
@@ -19,6 +21,9 @@ gcp_creds_json = json.loads(os.environ.get("GCP_SERVICE_ACCOUNT"))
 creds = Credentials.from_service_account_info(gcp_creds_json, scopes=["https://www.googleapis.com/auth/spreadsheets"])
 service = build("sheets", "v4", credentials=creds)
 sheet = service.spreadsheets()
+
+# Thread lock to keep Google Sheets API updates sequential and safe
+sheets_lock = Lock()
 
 # Write cookies file
 cookies_content = r'''# Netscape HTTP Cookie File
@@ -36,20 +41,17 @@ with open("cookies.txt", "w", encoding="utf-8") as f:
 # API & GOOGLE SHEETS UTILITIES
 # =======================================================
 def update_sheet_status(index, status, error_msg=""):
-    """
-    Directly writes to column C (Status) and column D (Error) for the current row index.
-    Includes a retry loop to prevent script crashes if the network drops.
-    """
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            sheet.values().update(
-                spreadsheetId=SPREADSHEET_ID, 
-                range=f"Sheet1!C{index}:D{index}",
-                valueInputOption="RAW", 
-                body={"values": [[status, error_msg]]}
-            ).execute()
-            print(f"[✓] Row {index} Updated in Sheets -> Status: {status} | Error: '{error_msg}'")
+            with sheets_lock:  # Prevent threads from overlapping API calls
+                sheet.values().update(
+                    spreadsheetId=SPREADSHEET_ID, 
+                    range=f"Sheet1!C{index}:D{index}",
+                    valueInputOption="RAW", 
+                    body={"values": [[status, error_msg]]}
+                ).execute()
+            print(f"[✓] Row {index} Updated -> Status: {status} | Error: '{error_msg}'")
             return True
         except Exception as e:
             print(f"[!] Sheets Update Attempt {attempt + 1} failed ({e}). Retrying...")
@@ -75,7 +77,6 @@ def upload_to_vidara(upload_server, video_path):
         return {"success": False, "error": "Local file target not found."}
     
     filename = os.path.basename(video_path)
-    print(f"\n[^] Handshaking multipart stream upload for: '{filename}'...")
     try:
         with open(video_path, "rb") as fp:
             payload = {
@@ -102,8 +103,68 @@ def upload_to_vidara(upload_server, video_path):
         return {"success": False, "error": str(e)}
 
 def sanitize_filename(filename):
-    """Removes illegal filesystem characters."""
     return re.sub(r'[\\/*?:"<>|]', "", filename).strip()
+
+# =======================================================
+# WORKER PIPELINE FOR A SINGLE ROW
+# =======================================================
+def process_row(row_data, upload_server):
+    index, row = row_data
+    while len(row) < 4:
+        row.append("")
+        
+    title, link, status, error = row[0].strip(), row[1].strip(), row[2].strip(), row[3].strip()
+    
+    if status.lower() in ["success", "failed"] or not link:
+        return
+
+    print(f"\n--- [Thread Start] Processing Row {index}: {title or 'Untitled'} ---")
+    
+    clean_title = sanitize_filename(title) if title else f"video_{index}"
+    final_video_name = f"{clean_title}.mp4"
+    
+    # Step 1: Video Capture Engine
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-headers", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36\r\n"
+                   "Referer: https://missav.live/\r\n"
+                   "Origin: https://missav.live\r\n",
+        "-i", link,
+        "-c", "copy",          # Stream copying (very fast, no re-encoding)
+        "-bsf:a", "aac_adtstoasc",
+        "-y",                  
+        final_video_name
+    ]
+    
+    process = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    
+    if not (os.path.exists(final_video_name) and os.path.getsize(final_video_name) > 0):
+        print(f"Download Engine Failed for Row {index}.")
+        log_tail = process.stdout[-200:] if process.stdout else "No log trace available."
+        update_sheet_status(index, "FAILED", f"ffmpeg capture failed: {log_tail}")
+        return
+
+    print(f"[✓] Row {index} video downloaded. Size: {os.path.getsize(final_video_name) / (1024*1024):.2f} MB")
+
+    # Step 2: Vidara Cloud Upload
+    print(f"Uploading file for Row {index} to Vidara...")
+    upload_result = upload_to_vidara(upload_server, final_video_name)
+    
+    # Step 3: Parse Handoff Output
+    if upload_result["success"]:
+        print(f"Successfully processed Row {index}!")
+        update_sheet_status(index, "SUCCESS", "")
+    else:
+        print(f"Upload logic failure on Row {index}.")
+        update_sheet_status(index, "FAILED", upload_result["error"])
+        
+    # Step 4: Local Storage Cleanup
+    if os.path.exists(final_video_name):
+        try:
+            os.remove(final_video_name)
+            print(f"[✓] Row {index} local cache cleared.")
+        except Exception as ce:
+            print(f"[!] Warning: Row {index} cache wipe alert: {ce}")
 
 # =======================================================
 # PIPELINE EXECUTION ENGINE
@@ -125,74 +186,20 @@ def main():
         print("Exiting pipeline: Vidara endpoint lookup failed.")
         return
 
+    # Filter rows that need processing to avoid spawning empty worker threads
+    valid_rows = []
     for index, row in enumerate(rows[1:], start=2):
-        while len(row) < 4:
-            row.append("")
-            
-        title, link, status, error = row[0].strip(), row[1].strip(), row[2].strip(), row[3].strip()
-        
-        # Skip rows that are already completed or already marked as failed
-        if status.lower() in ["success", "failed"]:
-            print(f"Row {index}: Skipped ({status})")
-            continue
-            
-        if not link:
-            print(f"Row {index}: Skipped due to empty download target URL.")
-            continue
+        while len(row) < 4: row.append("")
+        if row[2].strip().lower() not in ["success", "failed"] and row[1].strip():
+            valid_rows.append((index, row))
 
-        print(f"\n--- Processing Row {index}: {title or 'Untitled'} ---")
-        
-        # Define clean target filename from Title column
-        clean_title = sanitize_filename(title) if title else f"video_{index}"
-        final_video_name = f"{clean_title}.mp4"
-        
-        # Step 1: Video Capture Engine
-        print(f"Bypassing Cloudflare wrapper via direct ffmpeg socket...")
-        ffmpeg_cmd = [
-            "ffmpeg",
-            "-headers", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36\r\n"
-                       "Referer: https://missav.live/\r\n"
-                       "Origin: https://missav.live\r\n",
-            "-i", link,
-            "-c", "copy",          # Clone stream mode directly
-            "-bsf:a", "aac_adtstoasc",
-            "-y",                  # Force overwrite duplicate local files
-            final_video_name
-        ]
-        
-        process = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        
-        # Verify if the video downloaded correctly
-        if not (os.path.exists(final_video_name) and os.path.getsize(final_video_name) > 0):
-            print(f"Download Engine Failed for Row {index}.")
-            log_tail = process.stdout[-200:] if process.stdout else "No log trace available."
-            # Set Status to FAILED and pass the logs to Error column
-            update_sheet_status(index, "FAILED", f"ffmpeg capture failed: {log_tail}")
-            continue
-
-        print(f"[✓] Video successfully intercepted via pipeline. Size: {os.path.getsize(final_video_name) / (1024*1024):.2f} MB")
-
-        # Step 2: Vidara Cloud Upload Handshake
-        print(f"Uploading file named: '{final_video_name}' to Vidara...")
-        upload_result = upload_to_vidara(UPLOAD_SERVER, final_video_name)
-        
-        # Step 3: Parse Handoff Output and Record Status into Sheet
-        if upload_result["success"]:
-            print(f"Successfully processed Row {index}! Remote Code: {upload_result.get('filecode')}")
-            # Success -> Set Status to SUCCESS and completely wipe the Error column clean
-            update_sheet_status(index, "SUCCESS", "")
-        else:
-            print(f"Upload logic failure on Row {index}.")
-            # Failure -> Set Status to FAILED and set the exact API error message
-            update_sheet_status(index, "FAILED", upload_result["error"])
-            
-        # Step 4: Local Storage Cleanup
-        if os.path.exists(final_video_name):
-            try:
-                os.remove(final_video_name)
-                print("[✓] Local file cache cleared safely.")
-            except Exception as ce:
-                print(f"[!] Warning: Minor file wipe alert: {ce}")
+    # Process up to 3 videos concurrently. 
+    # (3 is a sweet spot for GitHub Actions network bandwidth vs disk limits)
+    max_workers = min(3, len(valid_rows)) if valid_rows else 1
+    
+    print(f"Starting Multi-threaded Execution Engine. Spawning {max_workers} worker threads...")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        executor.map(lambda r: process_row(r, UPLOAD_SERVER), valid_rows)
 
 if __name__ == "__main__":
     main()
